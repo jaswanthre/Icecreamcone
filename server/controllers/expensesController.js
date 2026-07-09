@@ -13,26 +13,41 @@ async function getOrCreateExpenseDoc(day) {
 
 // @desc  Add/update Stock / Salary / Rent expense for a date
 // @route POST /api/expenses/:date/:category  (category: stock|salary|rent)
-// @body  { phonepe, cash }
+// @body  { phonepe?, cash? }
 exports.upsertCategoryExpense = async (req, res) => {
   try {
     const { date, category } = req.params;
-    const { phonepe = 0, cash = 0 } = req.body;
+    const { phonepe, cash } = req.body;
 
     if (!VALID_CATEGORIES.includes(category)) {
       return res.status(400).json({ message: `Invalid category. Use one of: ${VALID_CATEGORIES.join(", ")}` });
     }
 
+    const hasPhonepe = phonepe !== undefined && phonepe !== null;
+    const hasCash = cash !== undefined && cash !== null;
+
+    if (!hasPhonepe && !hasCash) {
+      return res.status(400).json({ message: "Provide at least one of phonepe or cash for this expense update." });
+    }
+
+    const phonepeValue = hasPhonepe ? Number(phonepe) : undefined;
+    const cashValue = hasCash ? Number(cash) : undefined;
+
+    if ((hasPhonepe && Number.isNaN(phonepeValue)) || (hasCash && Number.isNaN(cashValue))) {
+      return res.status(400).json({ message: "Expense amounts must be valid numbers." });
+    }
+    if ((hasPhonepe && phonepeValue < 0) || (hasCash && cashValue < 0)) {
+      return res.status(400).json({ message: "Expense amounts cannot be negative." });
+    }
+
     const day = normalizeDate(date);
+    const update = { $set: { date: day } };
+    if (hasPhonepe) update.$set[`${category}.phonepe`] = phonepeValue;
+    if (hasCash) update.$set[`${category}.cash`] = cashValue;
+
     const doc = await Expense.findOneAndUpdate(
       { date: day },
-      {
-        $set: {
-          date: day,
-          [`${category}.phonepe`]: Number(phonepe) || 0,
-          [`${category}.cash`]: Number(cash) || 0,
-        },
-      },
+      update,
       { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
     );
 
@@ -79,6 +94,19 @@ exports.deleteOtherExpense = async (req, res) => {
     await doc.save();
 
     res.json(doc);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// @desc  Delete an expense document for a day
+// @route DELETE /api/expenses/:date
+exports.deleteExpenseByDate = async (req, res) => {
+  try {
+    const day = normalizeDate(req.params.date);
+    const deleted = await Expense.findOneAndDelete({ date: day });
+    if (!deleted) return res.status(404).json({ message: "No expense entry for this date." });
+    res.json({ message: "Expense entry deleted.", deleted });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

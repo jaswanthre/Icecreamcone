@@ -5,8 +5,8 @@ export type ExpenseCategory = "stock" | "salary" | "rent" | "others";
 export type ExpenseItem = {
   category: ExpenseCategory;
   description?: string;
-  phonepe: number;
-  cash: number;
+  phonepe?: number;
+  cash?: number;
 };
 
 export type DayEntry = {
@@ -22,6 +22,25 @@ export type DayEntry = {
 
 const ENTRIES_KEY = "scoops.entries.v1";
 const AUTH_KEY = "scoops.auth.v1";
+const API_BASE_URL = (import.meta.env.VITE_API_URL ?? "/api").replace(/\/$/, "");
+
+type SaleDocument = {
+  _id?: string;
+  date: string | Date;
+  opening: number;
+  phonepe: number;
+  cash: number;
+  sale?: number;
+  closing?: number;
+};
+
+type ExpenseDocument = {
+  date: string | Date;
+  stock?: { phonepe?: number; cash?: number };
+  salary?: { phonepe?: number; cash?: number };
+  rent?: { phonepe?: number; cash?: number };
+  others?: Array<{ _id?: string; type?: string; phonepe?: number; cash?: number }>;
+};
 
 export function isLoggedIn(): boolean {
   if (typeof window === "undefined") return false;
@@ -40,55 +59,168 @@ export function logout() {
   localStorage.removeItem(AUTH_KEY);
 }
 
-function migrate(e: DayEntry): DayEntry {
-  if (e.expenses) return e;
-  const list: ExpenseItem[] = [];
-  const ep = Number(e.expPhonepe) || 0;
-  const ec = Number(e.expCash) || 0;
-  if (ep > 0 || ec > 0) {
-    list.push({ category: "stock", phonepe: ep, cash: ec });
-  }
-  return { ...e, expenses: list };
-}
-
-export function getEntries(): DayEntry[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = localStorage.getItem(ENTRIES_KEY);
-    if (!raw) return [];
-    return (JSON.parse(raw) as DayEntry[]).map(migrate);
-  } catch {
-    return [];
-  }
-}
-
-export function saveEntries(entries: DayEntry[]) {
-  localStorage.setItem(ENTRIES_KEY, JSON.stringify(entries));
-}
-
-export function upsertEntry(entry: DayEntry) {
-  const list = getEntries().filter((e) => e.date !== entry.date);
-  list.push({ ...entry, expenses: entry.expenses ?? [] });
-  list.sort((a, b) => a.date.localeCompare(b.date));
-  saveEntries(list);
-}
-
-export function addExpense(date: string, item: ExpenseItem) {
-  const entries = getEntries();
-  const cur = entries.find((e) => e.date === date);
-  if (!cur) return;
-  cur.expenses = [...(cur.expenses ?? []), item];
-  saveEntries(entries);
-}
-
-export function deleteEntry(date: string) {
-  saveEntries(getEntries().filter((e) => e.date !== date));
-}
-
 export function todayISO(): string {
   const d = new Date();
   const tz = d.getTimezoneOffset() * 60000;
   return new Date(d.getTime() - tz).toISOString().slice(0, 10);
+}
+
+function toISODate(value: string | Date | undefined): string {
+  if (!value) return todayISO();
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return todayISO();
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    headers: {
+      "Content-Type": "application/json",
+      ...(init.headers || {}),
+    },
+    ...init,
+  });
+
+  const contentType = response.headers.get("content-type") || "";
+  const isJson = contentType.includes("application/json");
+  const body = isJson ? await response.json().catch(() => null) : await response.text().catch(() => null);
+
+  if (!response.ok) {
+    const message =
+      typeof body === "object" && body && "message" in body
+        ? String((body as { message?: string }).message)
+        : "Request failed";
+    throw new Error(message);
+  }
+
+  return (body ?? {}) as T;
+}
+
+function normalizeExpenses(doc: ExpenseDocument | null | undefined): ExpenseItem[] {
+  const items: ExpenseItem[] = [];
+
+  const addIfPresent = (category: ExpenseCategory, phonepe: number, cash: number, description?: string) => {
+    if (phonepe !== undefined && cash !== undefined && (phonepe > 0 || cash > 0)) {
+      items.push({ category, description, phonepe, cash });
+    }
+  };
+
+  if (doc?.stock) {
+    addIfPresent("stock", Number(doc.stock.phonepe) || 0, Number(doc.stock.cash) || 0);
+  }
+  if (doc?.salary) {
+    addIfPresent("salary", Number(doc.salary.phonepe) || 0, Number(doc.salary.cash) || 0);
+  }
+  if (doc?.rent) {
+    addIfPresent("rent", Number(doc.rent.phonepe) || 0, Number(doc.rent.cash) || 0);
+  }
+  if (doc?.others?.length) {
+    for (const item of doc.others) {
+      const phonepe = Number(item.phonepe) || 0;
+      const cash = Number(item.cash) || 0;
+      if (phonepe > 0 || cash > 0) {
+        items.push({
+          category: "others",
+          description: item.type || "Other expense",
+          phonepe,
+          cash,
+        });
+      }
+    }
+  }
+
+  return items;
+}
+
+async function fetchEntriesFromServer(): Promise<DayEntry[]> {
+  const [sales, expenses] = await Promise.all([
+    request<SaleDocument[]>("/sales?limit=1000"),
+    request<ExpenseDocument[]>("/expenses?limit=1000"),
+  ]);
+
+  const merged = new Map<string, DayEntry>();
+
+  for (const sale of sales) {
+    const date = toISODate(sale.date);
+    merged.set(date, {
+      date,
+      opening: Number(sale.opening) || 0,
+      phonepe: Number(sale.phonepe) || 0,
+      cash: Number(sale.cash) || 0,
+      expenses: [],
+    });
+  }
+
+  for (const expense of expenses) {
+    const date = toISODate(expense.date);
+    const existing = merged.get(date) ?? {
+      date,
+      opening: 0,
+      phonepe: 0,
+      cash: 0,
+      expenses: [],
+    };
+    existing.expenses = normalizeExpenses(expense);
+    merged.set(date, existing);
+  }
+
+  return Array.from(merged.values()).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+export async function getEntries(): Promise<DayEntry[]> {
+  return fetchEntriesFromServer();
+}
+
+export function saveEntries(entries: DayEntry[]) {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(ENTRIES_KEY, JSON.stringify(entries));
+}
+
+export async function upsertEntry(entry: DayEntry) {
+  await request("/sales", {
+    method: "POST",
+    body: JSON.stringify({
+      date: entry.date,
+      opening: entry.opening,
+      phonepe: entry.phonepe,
+      cash: entry.cash,
+    }),
+  });
+}
+
+export async function addExpense(date: string, item: ExpenseItem) {
+  if (item.category === "others") {
+    await request(`/expenses/${date}/others`, {
+      method: "POST",
+      body: JSON.stringify({
+        type: item.description || "Other expense",
+        phonepe: item.phonepe ?? 0,
+        cash: item.cash ?? 0,
+      }),
+    });
+    return;
+  }
+
+  const body: Record<string, number> = {};
+  if (item.phonepe !== undefined) body.phonepe = item.phonepe;
+  if (item.cash !== undefined) body.cash = item.cash;
+
+  await request(`/expenses/${date}/${item.category}`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteEntry(date: string) {
+  const sale = await request<SaleDocument>(`/sales/${date}`);
+  if (sale?._id) {
+    await request(`/sales/${sale._id}`, { method: "DELETE" });
+  }
+  try {
+    await request(`/expenses/${date}`, { method: "DELETE" });
+  } catch {
+    // Ignore missing expense docs; the sale delete already handled the main record.
+  }
 }
 
 function sumExp(items: ExpenseItem[] | undefined, cat?: ExpenseCategory) {
@@ -132,8 +264,8 @@ export function computeRows(entries: DayEntry[]) {
   });
 }
 
-export function downloadExcel() {
-  const rows = computeRows(getEntries()).map((r) => ({
+export function downloadExcel(entries: DayEntry[]) {
+  const rows = computeRows(entries).map((r) => ({
     Date: r.date,
     "Opening Balance": r.opening,
     "PhonePe (Today)": r.phonepe,
@@ -162,7 +294,7 @@ export function downloadExcel() {
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Daily Sales");
 
-  const monthly = computeMonthly(getEntries()).map((m) => ({
+  const monthly = computeMonthly(entries).map((m) => ({
     Month: m.month,
     "Total Sale": m.sale,
     "Total PhonePe": m.phonepe,

@@ -108,9 +108,22 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [date, setDate] = useState(todayISO());
   const [phonepe, setPhonepe] = useState("");
   const [cash, setCash] = useState("");
+  const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState(false);
 
-  const refresh = () => setEntries(getEntries());
-  useEffect(refresh, []);
+  const parseAmount = (value: string) => {
+    if (value.trim() === "") return 0;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : NaN;
+  };
+
+  const refresh = async () => {
+    setEntries(await getEntries());
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, []);
 
   const rows = useMemo(() => computeRows(entries), [entries]);
   const monthly = useMemo(() => computeMonthly(entries), [entries]);
@@ -130,39 +143,73 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
     }
   }, [date, existing]);
 
-  const pp = Number(phonepe) || 0;
-  const cs = Number(cash) || 0;
-  const todaySale = pp + cs;
+  const pp = parseAmount(phonepe);
+  const cs = parseAmount(cash);
+  const todaySale = (Number.isNaN(pp) ? 0 : pp) + (Number.isNaN(cs) ? 0 : cs);
 
-  const save = () => {
-    upsertEntry({
-      date,
-      opening: yesterdayClosing,
-      phonepe: pp,
-      cash: cs,
-      expenses: existing?.expenses ?? [],
-    });
-    refresh();
+  const runAction = async (task: () => Promise<void>) => {
+    setBusy(true);
+    setStatus("");
+    try {
+      await task();
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setBusy(false);
+    }
   };
 
-  const addExpenseAndRefresh = (
-    category: ExpenseCategory,
-    ppAmt: number,
-    csAmt: number,
-    description?: string,
-  ) => {
-    if (!existing) {
-      upsertEntry({
+  const save = () => {
+    void runAction(async () => {
+      if (Number.isNaN(pp) || Number.isNaN(cs)) {
+        throw new Error("Please enter valid numeric values for PhonePe and Cash.");
+      }
+      if (pp < 0 || cs < 0) {
+        throw new Error("Amounts cannot be negative.");
+      }
+
+      await upsertEntry({
         date,
         opening: yesterdayClosing,
         phonepe: pp,
         cash: cs,
-        expenses: [{ category, phonepe: ppAmt, cash: csAmt, description }],
+        expenses: existing?.expenses ?? [],
       });
-    } else {
-      addExpense(date, { category, phonepe: ppAmt, cash: csAmt, description });
-    }
-    refresh();
+      await refresh();
+      setStatus("Saved to the shared daybook.");
+    });
+  };
+
+  const addExpenseAndRefresh = (
+    category: ExpenseCategory,
+    ppAmt: number | undefined,
+    csAmt: number | undefined,
+    description?: string,
+  ) => {
+    void runAction(async () => {
+      if (Number.isNaN(ppAmt ?? 0) || Number.isNaN(csAmt ?? 0)) {
+        throw new Error("Please enter valid numeric values for expense amounts.");
+      }
+      if ((ppAmt ?? 0) < 0 || (csAmt ?? 0) < 0) {
+        throw new Error("Expense amounts cannot be negative.");
+      }
+      if ((ppAmt ?? 0) + (csAmt ?? 0) <= 0) {
+        throw new Error("Enter at least one expense amount greater than zero.");
+      }
+
+      if (!existing) {
+        await upsertEntry({
+          date,
+          opening: yesterdayClosing,
+          phonepe: pp,
+          cash: cs,
+          expenses: [],
+        });
+      }
+      await addExpense(date, { category, phonepe: ppAmt, cash: csAmt, description });
+      await refresh();
+      setStatus("Expense recorded.");
+    });
   };
 
   const totals = rows[rows.length - 1];
@@ -180,7 +227,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
         </div>
         <div className="flex gap-2">
           <button
-            onClick={downloadExcel}
+            onClick={() => downloadExcel(entries)}
             className="rounded-full bg-[#7dd3a0] px-4 py-2 text-sm font-semibold text-white shadow hover:bg-[#5cbf87] transition"
           >
             ⬇ Download Excel
@@ -325,8 +372,11 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
                         <button
                           onClick={() => {
                             if (confirm(`Delete entry for ${r.date}?`)) {
-                              deleteEntry(r.date);
-                              setEntries(getEntries());
+                              void runAction(async () => {
+                                await deleteEntry(r.date);
+                                await refresh();
+                                setStatus("Entry removed.");
+                              });
                             }
                           }}
                           className="text-xs text-red-400 hover:text-red-600"
@@ -393,8 +443,9 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
         )}
       </section>
 
+      {status ? <p className="mt-4 text-center text-sm text-[#e85a71]">{status}</p> : null}
       <p className="text-center text-xs text-[#8a6b75] mt-6">
-        Data stays on this device. Download Excel to back up 💾
+        Data is synced with the shared daybook server. Download Excel to back up 💾
       </p>
     </div>
   );
@@ -514,17 +565,27 @@ function ExpenseDropdown({
   title: string;
   already: { pp: number; cs: number };
   requireDescription?: boolean;
-  onSubmit: (pp: number, cs: number, description?: string) => void;
+  onSubmit: (pp: number | undefined, cs: number | undefined, description?: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [desc, setDesc] = useState("");
   const [pp, setPp] = useState("");
   const [cs, setCs] = useState("");
 
-  const p = Number(pp) || 0;
-  const c = Number(cs) || 0;
-  const total = p + c;
-  const canSubmit = total > 0 && (!requireDescription || desc.trim().length > 0);
+  const p = pp.trim() === "" ? undefined : Number(pp);
+  const c = cs.trim() === "" ? undefined : Number(cs);
+  const pValid = p === undefined || (!Number.isNaN(p) && p >= 0);
+  const cValid = c === undefined || (!Number.isNaN(c) && c >= 0);
+  const total = (p ?? 0) + (c ?? 0);
+  const canSubmit = total > 0 && pValid && cValid && (!requireDescription || desc.trim().length > 0);
+  const errorMessage =
+    !pValid || !cValid
+      ? "Enter valid non-negative amounts."
+      : total <= 0
+      ? "Enter at least one expense amount."
+      : requireDescription && !desc.trim()
+      ? "Description is required for this expense."
+      : "";
 
   const submit = () => {
     if (!canSubmit) return;
