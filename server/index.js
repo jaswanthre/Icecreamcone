@@ -11,7 +11,43 @@ const app = express();
 
 connectDB();
 
-app.use(cors({ origin: process.env.CLIENT_ORIGIN || "*" }));
+// Configure CORS to accept a comma-separated list in CLIENT_ORIGIN.
+// Examples:
+//  - CLIENT_ORIGIN=https://example.com
+//  - CLIENT_ORIGIN=https://one.example.com,https://two.example.com
+//  - CLIENT_ORIGIN=.vercel.app   (allows any vercel.app preview hostname)
+const rawAllowed = process.env.CLIENT_ORIGIN || "";
+const allowedOrigins = rawAllowed
+  .split(",")
+  .map((s) => s.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow non-browser requests (Postman, curl) with no Origin header
+      if (!origin) return callback(null, true);
+
+      const normalized = origin.replace(/\/+$/, "");
+
+      // Exact match
+      if (allowedOrigins.includes(normalized)) return callback(null, true);
+
+      // If environment includes any vercel.app token, allow any vercel.app origin
+      if (allowedOrigins.some((a) => a.includes("vercel.app"))) {
+        try {
+          const url = new URL(origin);
+          if (url.hostname.endsWith(".vercel.app")) return callback(null, true);
+        } catch (e) {
+          // fallthrough
+        }
+      }
+
+      return callback(new Error("Not allowed by CORS"));
+    },
+    optionsSuccessStatus: 200,
+  })
+);
 app.use(express.json());
 
 app.get("/", (req, res) => {
