@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: nistic-daybook-backend
+    env: node
+    plan: free
+    region: oregon
+    buildCommand: "cd server && npm install"
+    startCommand: "cd server && npm start"
+    envVars:
+      - key: MONGO_URI
+        scope: RUN
+      - key: CLIENT_ORIGIN
+        scope: RUN
+      - key: PORT
+        value: "5000"
